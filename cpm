@@ -1,0 +1,503 @@
+#!/bin/sh
+# cpm - Simple xbps wrapper for Void Linux
+# Works inside Android proot (already root, no sudo needed)
+
+set -e
+
+CPM_VERSION="1.4.0"
+CPM_DIR="${HOME}/.cpm"
+CPM_LOG="${CPM_DIR}/history.log"
+CPM_PINS="${CPM_DIR}/pinned"
+CPM_SNAP="${CPM_DIR}/snapshots"
+CPM_SYNC_TS="${CPM_DIR}/last_sync"
+CPM_CONF="${CPM_DIR}/config"
+CPM_REMOTE="https://raw.githubusercontent.com/NotSaish/cpm-packages/main/cpm"
+
+# ── Default Config ────────────────────────────────────────────────────────────
+# These are defaults — overridden by config file
+AUTO_SYNC="yes"          # auto sync repos before install
+SYNC_INTERVAL=3600       # seconds (default 1 hour)
+
+# ── Init ─────────────────────────────────────────────────────────────────────
+
+init_dirs() {
+    mkdir -p "$CPM_DIR" "$CPM_SNAP"
+    touch "$CPM_LOG" "$CPM_PINS" "$CPM_SYNC_TS"
+
+    # Create default config if not exists
+    if [ ! -f "$CPM_CONF" ]; then
+        cat > "$CPM_CONF" <<'EOF'
+# cpm config file
+# ~/.cpm/config
+
+# Auto sync repos before install (yes/no)
+AUTO_SYNC=yes
+
+# How often to sync repos in seconds
+# 3600 = 1 hour, 7200 = 2 hours, 86400 = 1 day
+SYNC_INTERVAL=3600
+EOF
+        msg "config created at $CPM_CONF"
+    fi
+
+    # Load config
+    # shellcheck disable=SC1090
+    . "$CPM_CONF"
+}
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+msg() { printf '[cpm] %s\n' "$1"; }
+err() { printf '[cpm] error: %s\n' "$1" >&2; }
+
+need_pkg() {
+    if [ -z "${1-}" ]; then
+        err "no package name given"
+        exit 1
+    fi
+}
+
+log_action() {
+    action="$1"
+    pkg="$2"
+    timestamp=$(date '+%Y-%m-%d %H:%M')
+    printf '[%s] %s %s\n' "$timestamp" "$action" "$pkg" >> "$CPM_LOG"
+}
+
+# Sync repos only if last sync was stale
+sync_if_stale() {
+    # If auto sync disabled in config — skip
+    if [ "$AUTO_SYNC" = "no" ]; then
+        return 0
+    fi
+
+    now=$(date +%s)
+    if [ -f "$CPM_SYNC_TS" ]; then
+        last=$(cat "$CPM_SYNC_TS")
+        diff=$((now - last))
+        if [ "$diff" -lt "$SYNC_INTERVAL" ]; then
+            remaining=$(( (SYNC_INTERVAL - diff) / 60 ))
+            msg "repos fresh — next sync in ~${remaining}m (run 'cpm update' to force)"
+            return 0
+        fi
+    fi
+    msg "syncing repos..."
+    xbps-install -S 2>/dev/null || true
+    printf '%s\n' "$now" > "$CPM_SYNC_TS"
+}
+
+# Suggest similar packages when install fails
+suggest() {
+    pkg="$1"
+    msg "'$pkg' not found in repos. Searching for similar..."
+    results=$(xbps-query -Rs "$pkg" 2>/dev/null | head -5)
+    if [ -z "$results" ]; then
+        msg "No similar packages found."
+        msg "Try: cpm search <keyword>"
+    else
+        printf '\nDid you mean?\n'
+        echo "$results" | while IFS= read -r line; do
+            pkgname=$(echo "$line" | awk '{print $2}' | rev | cut -d'-' -f2- | rev)
+            printf '  cpm install %s\n' "$pkgname"
+        done
+    fi
+}
+
+parse_flags() {
+    YES_FLAG=""
+    PKGS=""
+    for arg in "$@"; do
+        case "$arg" in
+            -y|--yes) YES_FLAG="-y" ;;
+            -n|--no)  YES_FLAG="-n" ;;
+            *) PKGS="$PKGS $arg" ;;
+        esac
+    done
+    PKGS="${PKGS# }"
+}
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+cmd_install() {
+    parse_flags "$@"
+    need_pkg "$PKGS"
+
+    for p in $PKGS; do
+        if grep -qx "$p" "$CPM_PINS" 2>/dev/null; then
+            err "'$p' is pinned — unpin first with: cpm unpin $p"
+            exit 1
+        fi
+    done
+
+    msg "installing: $PKGS"
+    sync_if_stale
+    if ! xbps-install $YES_FLAG $PKGS; then
+        net_err=$(xbps-install $YES_FLAG $PKGS 2>&1 || true)
+        if echo "$net_err" | grep -qi "failed to fetch\|network\|unreachable\|timeout\|ssl"; then
+            err "network error — check your connection or repo."
+        else
+            suggest "$(echo "$PKGS" | awk '{print $1}')"
+        fi
+        exit 1
+    fi
+    log_action "install" "$PKGS"
+}
+
+cmd_remove() {
+    parse_flags "$@"
+    need_pkg "$PKGS"
+
+    for p in $PKGS; do
+        if grep -qx "$p" "$CPM_PINS" 2>/dev/null; then
+            err "'$p' is pinned — unpin first with: cpm unpin $p"
+            exit 1
+        fi
+    done
+
+    msg "removing: $PKGS"
+    xbps-remove -R $YES_FLAG $PKGS
+    log_action "remove" "$PKGS"
+}
+
+cmd_update() {
+    # 1. Repo sync
+    msg "syncing repos..."
+    xbps-install -S
+    printf '%s\n' "$(date +%s)" > "$CPM_SYNC_TS"
+    log_action "update" "repos"
+
+    # 2. cpm self update
+    msg "checking for cpm updates..."
+    tmp=$(mktemp)
+    if ! wget -q -O "$tmp" "$CPM_REMOTE" 2>/dev/null; then
+        msg "cpm self-update skipped — network error."
+        rm -f "$tmp"
+        return 0
+    fi
+
+    # Extract remote version
+    remote_ver=$(grep '^CPM_VERSION=' "$tmp" | cut -d'"' -f2)
+    if [ -z "$remote_ver" ]; then
+        msg "cpm self-update skipped — could not read remote version."
+        rm -f "$tmp"
+        return 0
+    fi
+
+    if [ "$remote_ver" = "$CPM_VERSION" ]; then
+        msg "cpm is up to date ($CPM_VERSION)."
+        rm -f "$tmp"
+        return 0
+    fi
+
+    msg "new version found: $remote_ver (current: $CPM_VERSION)"
+    msg "updating cpm..."
+    chmod +x "$tmp"
+    cp "$tmp" "$(command -v cpm)"
+    rm -f "$tmp"
+    msg "cpm updated to $remote_ver — restart to apply."
+    log_action "self-update" "$remote_ver"
+}
+
+cmd_upgrade() {
+    # Sirf upgrade — sync bhi karega agar stale
+    msg "upgrading packages..."
+    xbps-install -Su
+    printf '%s\n' "$(date +%s)" > "$CPM_SYNC_TS"
+    log_action "upgrade" "all"
+}
+
+cmd_search() {
+    need_pkg "${1-}"
+    xbps-query -Rs "$@"
+}
+
+cmd_info() {
+    need_pkg "${1-}"
+    xbps-query -S "$@"
+}
+
+cmd_list() {
+    xbps-query -l
+}
+
+cmd_clean() {
+    msg "removing orphans and cached files..."
+    xbps-remove -Oo
+    log_action "clean" "-"
+}
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+cmd_config() {
+    subcmd="${1-}"
+    case "$subcmd" in
+        show|"")
+            printf 'Config file: %s\n\n' "$CPM_CONF"
+            cat "$CPM_CONF"
+            ;;
+        edit)
+            # Use $EDITOR or fallback to vi
+            editor="${EDITOR:-vi}"
+            "$editor" "$CPM_CONF"
+            ;;
+        set)
+            key="${2-}"
+            val="${3-}"
+            if [ -z "$key" ] || [ -z "$val" ]; then
+                err "usage: cpm config set <key> <value>"
+                err "keys: AUTO_SYNC, SYNC_INTERVAL"
+                exit 1
+            fi
+            # Validate keys
+            case "$key" in
+                AUTO_SYNC)
+                    if [ "$val" != "yes" ] && [ "$val" != "no" ]; then
+                        err "AUTO_SYNC must be 'yes' or 'no'"
+                        exit 1
+                    fi
+                    ;;
+                SYNC_INTERVAL)
+                    # Must be a number
+                    case "$val" in
+                        ''|*[!0-9]*) err "SYNC_INTERVAL must be a number (seconds)"; exit 1 ;;
+                    esac
+                    ;;
+                *)
+                    err "unknown key '$key' — valid: AUTO_SYNC, SYNC_INTERVAL"
+                    exit 1
+                    ;;
+            esac
+            tmp=$(mktemp)
+            grep -v "^${key}=" "$CPM_CONF" > "$tmp"
+            printf '%s=%s\n' "$key" "$val" >> "$tmp"
+            mv "$tmp" "$CPM_CONF"
+            msg "set $key=$val"
+            ;;
+        *)
+            err "unknown config command — use: show, edit, set"
+            exit 1
+            ;;
+    esac
+}
+
+# ── History ───────────────────────────────────────────────────────────────────
+
+cmd_history() {
+    if [ ! -s "$CPM_LOG" ]; then
+        msg "no history yet."
+        return
+    fi
+    lines="${1:-20}"
+    printf 'Last %s actions:\n' "$lines"
+    tail -n "$lines" "$CPM_LOG"
+}
+
+cmd_history_clear() {
+    : > "$CPM_LOG"
+    msg "history cleared."
+}
+
+cmd_last() {
+    if [ ! -s "$CPM_LOG" ]; then
+        msg "no history yet."
+        return
+    fi
+    tail -n 1 "$CPM_LOG"
+}
+
+# ── Pin ───────────────────────────────────────────────────────────────────────
+
+cmd_pin() {
+    need_pkg "${1-}"
+    for p in "$@"; do
+        if grep -qx "$p" "$CPM_PINS" 2>/dev/null; then
+            msg "'$p' is already pinned."
+        else
+            printf '%s\n' "$p" >> "$CPM_PINS"
+            xbps-pkgdb -m hold "$p" 2>/dev/null || true
+            msg "pinned: $p"
+        fi
+    done
+}
+
+cmd_unpin() {
+    need_pkg "${1-}"
+    for p in "$@"; do
+        if grep -qx "$p" "$CPM_PINS" 2>/dev/null; then
+            tmp=$(mktemp)
+            grep -vx "$p" "$CPM_PINS" > "$tmp" && mv "$tmp" "$CPM_PINS"
+            xbps-pkgdb -m unhold "$p" 2>/dev/null || true
+            msg "unpinned: $p"
+        else
+            msg "'$p' is not pinned."
+        fi
+    done
+}
+
+cmd_pinned() {
+    if [ ! -s "$CPM_PINS" ]; then
+        msg "no pinned packages."
+        return
+    fi
+    printf 'Pinned packages:\n'
+    cat "$CPM_PINS"
+}
+
+# ── Size ─────────────────────────────────────────────────────────────────────
+
+cmd_size() {
+    need_pkg "${1-}"
+    pkg="$1"
+    info=$(xbps-query -S "$pkg" 2>/dev/null)
+    if [ -z "$info" ]; then
+        info=$(xbps-query -RS "$pkg" 2>/dev/null)
+    fi
+    if [ -z "$info" ]; then
+        err "'$pkg' not found."
+        exit 1
+    fi
+    printf 'Package : %s\n' "$pkg"
+    printf '%s\n' "$info" | grep -E "^(package|version|installed_size|filename-size)" || true
+}
+
+# ── Snapshot ──────────────────────────────────────────────────────────────────
+
+cmd_snapshot() {
+    name="${1:-default}"
+    snapfile="${CPM_SNAP}/${name}.txt"
+    xbps-query -l | awk '{print $2}' | rev | cut -d'-' -f2- | rev > "$snapfile"
+    count=$(wc -l < "$snapfile")
+    msg "snapshot '$name' saved — $count packages → $snapfile"
+}
+
+cmd_restore() {
+    name="${1:-default}"
+    snapfile="${CPM_SNAP}/${name}.txt"
+    if [ ! -f "$snapfile" ]; then
+        err "snapshot '$name' not found. Use: cpm snapshots"
+        exit 1
+    fi
+    msg "restoring snapshot '$name'..."
+    pkgs=$(tr '\n' ' ' < "$snapfile")
+    xbps-install -S $pkgs
+    log_action "restore" "$name"
+}
+
+cmd_snapshots() {
+    if [ -z "$(ls "$CPM_SNAP" 2>/dev/null)" ]; then
+        msg "no snapshots found."
+        return
+    fi
+    printf 'Saved snapshots:\n'
+    for f in "$CPM_SNAP"/*.txt; do
+        name=$(basename "$f" .txt)
+        count=$(wc -l < "$f")
+        printf '  %s  (%s packages)\n' "$name" "$count"
+    done
+}
+
+# ── Deps ──────────────────────────────────────────────────────────────────────
+
+cmd_deps() {
+    need_pkg "${1-}"
+    pkg="$1"
+    msg "dependencies of '$pkg':"
+    xbps-query -S "$pkg" 2>/dev/null | grep "^run_depends" \
+        || xbps-query -RS "$pkg" 2>/dev/null | grep "^run_depends" \
+        || msg "no dependencies found (or package not found)."
+}
+
+# ── Help ─────────────────────────────────────────────────────────────────────
+
+show_help() {
+    cat <<EOF
+cpm $CPM_VERSION — xbps wrapper for Void Linux
+
+Usage: cpm <command> [args] [-y/-n]
+
+  Core:
+    install <pkg>       Install package(s)
+    remove  <pkg>       Remove package(s) + deps
+    update              Sync repos only
+    upgrade             Upgrade all packages
+    search  <query>     Search in repos
+    info    <pkg>       Show package details
+    list                List installed packages
+    clean               Remove orphans + cache
+    size    <pkg>       Show package size
+
+  Config:
+    config show         Show current config
+    config edit         Edit config in \$EDITOR
+    config set <k> <v>  Set a config value
+                        Keys: AUTO_SYNC, SYNC_INTERVAL
+
+  History:
+    history [n]         Show last n actions (default 20)
+    history clear       Clear history log
+    last                Show last action
+
+  Pin:
+    pin   <pkg>         Lock package from updates/removal
+    unpin <pkg>         Unlock package
+    pinned              List pinned packages
+
+  Snapshot:
+    snapshot [name]     Save installed packages list
+    restore  [name]     Reinstall from snapshot
+    snapshots           List saved snapshots
+
+  Deps:
+    deps <pkg>          Show package dependencies
+
+  Other:
+    help                Show this help
+    version             Show cpm version
+
+Flags (install/remove):
+    -y / --yes          Auto confirm
+    -n / --no           Auto deny
+
+EOF
+}
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+init_dirs
+
+if [ $# -eq 0 ]; then
+    show_help
+    exit 0
+fi
+
+CMD="$1"
+shift
+
+case "$CMD" in
+    install|i|add)            cmd_install "$@" ;;
+    remove|rm|del|uninstall)  cmd_remove "$@" ;;
+    update|sync)              cmd_update ;;
+    upgrade|up)               cmd_upgrade ;;
+    search|se|find)           cmd_search "$@" ;;
+    info|show|inf)            cmd_info "$@" ;;
+    list|ls)                  cmd_list ;;
+    clean|cl|autoremove)      cmd_clean ;;
+    size|sz)                  cmd_size "$@" ;;
+    config|cfg)               cmd_config "$@" ;;
+    history|hist)
+        if [ "${1-}" = "clear" ]; then cmd_history_clear
+        else cmd_history "${1-}"; fi ;;
+    last)                     cmd_last ;;
+    pin)                      cmd_pin "$@" ;;
+    unpin)                    cmd_unpin "$@" ;;
+    pinned)                   cmd_pinned ;;
+    snapshot|snap)            cmd_snapshot "${1-}" ;;
+    restore)                  cmd_restore "${1-}" ;;
+    snapshots)                cmd_snapshots ;;
+    deps|dep)                 cmd_deps "$@" ;;
+    help|-h|--help)           show_help ;;
+    version|-v|--version)     printf 'cpm %s\n' "$CPM_VERSION" ;;
+    *)
+        err "unknown command '$CMD' — run 'cpm help'"
+        exit 1 ;;
+esac
